@@ -1,0 +1,209 @@
+name: Linux release package
+
+# Builds Kaizen for Linux for a PUBLISHED release and attaches it to that same
+# release, so every version ships Linux beside Kaizen-Setup.exe and the ZIP.
+# Modelled on shinytracker-builds' linux-release.yml.
+#
+# Started by the source repo's packaging/publish_release.py after each Windows
+# publish. By hand:
+#
+#   gh workflow run linux-release.yml --repo KaizenMMO/kaizen-builds \
+#     -f source_sha=<pushed commit in KaizenMMO/Kaizen> -f release_tag=v2.14
+#
+# What it leaves on the release:
+#   Kaizen-Linux-x86_64.tar.gz (+ .sha256) -- ONE FIXED NAME, so
+#     releases/latest/download/Kaizen-Linux-x86_64.tar.gz
+#     is a permanent link to the newest Linux build (the app's "Copy Linux
+#     link" button and README-LINUX.txt both use it).
+#   A "## Linux" section in the release notes, between markers.
+#
+# There is no manifest step: Kaizen's updates are announced by the
+# kaizen_releases table, and a Linux copy checks that THIS release has the
+# Linux file before telling the player (src/update/checker.py).
+#
+# Free: this repo is public, and public repos do not use Actions minutes.
+# ubuntu-22.04 on purpose: a PyInstaller build only runs on systems with the
+# build host's glibc or newer, and 22.04's (2.35) is older than every current
+# mainstream desktop distribution.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact KaizenMMO/Kaizen commit (must be pushed)
+        required: true
+        type: string
+      release_tag:
+        description: Published release tag to attach to, e.g. v2.14
+        required: true
+        type: string
+      run_tests:
+        description: Run the full suite before building
+        required: false
+        default: true
+        type: boolean
+      tests_only:
+        description: Stop after the tests (diagnosis; touches no release)
+        required: false
+        default: false
+        type: boolean
+      test_build:
+        description: Tester build - attach only to a PRE-release tag (e.g. linux-test); no notes
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    # A hang must not run for hours; every long step has its own limit too.
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: source
+    env:
+      QT_QPA_PLATFORM: offscreen
+      USE_AUTO_UPDATE: "0"
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      STABLE_NAME: Kaizen-Linux-x86_64.tar.gz
+    steps:
+      - name: Check out the source commit
+        uses: actions/checkout@v4
+        with:
+          repository: KaizenMMO/Kaizen
+          ref: ${{ inputs.source_sha }}
+          # A READ-ONLY deploy key on KaizenMMO/Kaizen: reads that one repo,
+          # cannot push, does not expire. See README for its setup.
+          ssh-key: ${{ secrets.KAIZEN_SOURCE_SSH_KEY }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: source/requirements.txt
+      - name: Install system libraries and Tesseract
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng \
+            libegl1 libopengl0 libgl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxcb-shape0 \
+            libdbus-1-3 patchelf ccache
+      - name: Install Python dependencies
+        # llama-cpp-python has its prebuilt CPU wheels only on the project's
+        # own index (same flag as the source repo's build.yml).
+        run: |
+          python -m pip install -r requirements.txt \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+          python -m pip install pytest==9.1.1 discord.py==2.7.1 \
+            pyinstaller==6.22.0 nuitka==4.1.3
+          python -c "import cv2, PyQt5.QtCore; print('cv2', cv2.__version__, 'Qt', PyQt5.QtCore.QT_VERSION_STR)"
+          tesseract --version | head -1
+      - name: Check the release matches this source
+        run: |
+          version=$(python -c "from src.version import __version__; print(__version__)")
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          if [ "${{ inputs.tests_only }}" = "true" ]; then
+            exit 0
+          fi
+          # A TESTER BUILD goes to a pre-release and nowhere else, so the
+          # permanent link never serves it.
+          if [ "${{ inputs.test_build }}" = "true" ]; then
+            pre=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
+            if [ "$pre" != "true" ]; then
+              echo "::error::test builds attach only to a pre-release; $RELEASE_TAG is not one"
+              exit 1
+            fi
+            exit 0
+          fi
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::Source is v$version but the release tag is $RELEASE_TAG"
+            exit 1
+          fi
+          state=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease -q '"\(.isDraft) \(.isPrerelease)"')
+          if [ "$state" != "false false" ]; then
+            echo "::error::$RELEASE_TAG must be a published, non-prerelease release (draft prerelease: $state)"
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx Kaizen-Setup.exe \
+            || { echo "::error::$RELEASE_TAG has no Kaizen-Setup.exe; publish the Windows build first"; exit 1; }
+      - name: Test
+        if: ${{ inputs.run_tests || inputs.tests_only }}
+        # THIS LOG IS PUBLIC and the source is not: --tb=no prints each failure
+        # as its test name and one-line reason, never the source lines a
+        # traceback would quote. Reproduce a failure from the source repo.
+        # At 25 min `timeout` sends SIGABRT, which faulthandler turns into a
+        # dump of every thread's stack (a headless hang names its test).
+        timeout-minutes: 30
+        run: timeout -k 30s -s ABRT 25m python -X faulthandler -m pytest -q --tb=no -rfE -p no:cacheprovider -o faulthandler_timeout=300
+      - name: Build and smoke-test the frozen app
+        if: ${{ !inputs.tests_only }}
+        timeout-minutes: 45
+        run: python packaging/build_linux.py
+      - name: Package under the permanent name
+        if: ${{ !inputs.tests_only }}
+        run: |
+          cd dist/release
+          cp "Kaizen-$VERSION-Linux-x86_64.tar.gz" "$STABLE_NAME"
+          sha256sum "$STABLE_NAME" > "$STABLE_NAME.sha256"
+          cat "$STABLE_NAME.sha256"
+          ls -l "$STABLE_NAME"
+      - name: Attach to the release and verify the public download
+        if: ${{ !inputs.tests_only }}
+        timeout-minutes: 10
+        run: |
+          gh release upload "$RELEASE_TAG" "dist/release/$STABLE_NAME" "dist/release/$STABLE_NAME.sha256" \
+            --clobber --repo "$GITHUB_REPOSITORY"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$STABLE_NAME"
+          curl -fsSL -H 'Cache-Control: no-cache' "$url?verify=$(date +%s)" -o "$RUNNER_TEMP/public.tar.gz"
+          cmp "$RUNNER_TEMP/public.tar.gz" "dist/release/$STABLE_NAME"
+          echo "Public download verified: $url"
+      - name: Add the Linux instructions to the release notes
+        if: ${{ !inputs.tests_only && !inputs.test_build }}
+        timeout-minutes: 5
+        # Between markers, so a re-run REPLACES the section rather than adding
+        # a second one. The full instructions are README-LINUX.txt, inside the
+        # download itself.
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > "$RUNNER_TEMP/body.md"
+          python - "$RUNNER_TEMP/body.md" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          body = open(path, encoding="utf-8").read()
+          start, end = "<!-- linux-start -->", "<!-- linux-end -->"
+          body = re.sub(re.escape(start) + r".*?" + re.escape(end), "", body, flags=re.S).rstrip()
+          section = f"""{start}
+          ## Linux
+
+          **[Download for Linux (x86-64)](https://github.com/KaizenMMO/kaizen-builds/releases/latest/download/Kaizen-Linux-x86_64.tar.gz)**, always the newest version.
+
+          1. Use an **X11** session, not Wayland: Kaizen cannot see the screen on Wayland. Check with `echo $XDG_SESSION_TYPE`.
+          2. Extract it (`tar -xzf Kaizen-Linux-x86_64.tar.gz`) and run `Kaizen/Kaizen`.
+          3. If Tesseract is missing, Kaizen shows the install command for your system with a Copy button.
+
+          Full instructions and troubleshooting are in `README-LINUX.txt` inside the download.
+          {end}"""
+          open(path, "w", encoding="utf-8").write(body + "\n\n" + section + "\n")
+          PY
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/body.md"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body | grep -c "linux-start" | grep -qx 1
+      - name: Verify the permanent link
+        if: ${{ !inputs.tests_only && !inputs.test_build }}
+        timeout-minutes: 5
+        run: |
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          if [ "$latest" = "$RELEASE_TAG" ]; then
+            curl -fsSIL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$STABLE_NAME" | grep -i '^location' | tail -1
+            echo "Permanent link serves $RELEASE_TAG"
+          else
+            echo "::warning::$RELEASE_TAG is not the latest release ($latest), so the permanent link does not serve it"
+          fi
