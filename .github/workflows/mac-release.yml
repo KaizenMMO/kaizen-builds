@@ -21,7 +21,9 @@ name: Mac release package
 # ad-hoc only and players allow it once with "Open Anyway" (README-MAC.txt).
 #
 # Free: this repo is public, and public repos do not use Actions minutes
-# (macOS runners included). macos-14 = Apple Silicon (arm64).
+# (macOS runners included). macos-15 = Apple Silicon (arm64). macos-14 was
+# refused ("configuration not supported") from 2026-11-06; the deployment
+# target below keeps the app runnable on macOS 13 as Info.plist promises.
 
 on:
   workflow_dispatch:
@@ -59,7 +61,7 @@ concurrency:
 
 jobs:
   mac:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     defaults:
       run:
@@ -67,6 +69,7 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
       USE_AUTO_UPDATE: "0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.release_tag }}
       STABLE_NAME: Kaizen-Mac-AppleSilicon.dmg
