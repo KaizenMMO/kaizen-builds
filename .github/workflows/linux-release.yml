@@ -106,7 +106,17 @@ jobs:
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
           python -m pip install pytest==9.1.1 discord.py==2.7.1 \
             pyinstaller==6.22.0 nuitka==4.1.3
-          python -c "import cv2, PyQt5.QtCore; print('cv2', cv2.__version__, 'Qt', PyQt5.QtCore.QT_VERSION_STR)"
+          # HEADLESS OpenCV on Linux (same version as requirements.txt). The
+          # GUI wheel ships its own Qt 5 and, on import, points Qt at its own
+          # plugins: PyQt5's X11 plugin then fails to load ("Could not load
+          # the Qt platform plugin xcb in .../cv2/qt/plugins") and Kaizen
+          # falls through to native Wayland (Lugario, Bazzite, 2026-11-06).
+          # The app never opens a cv2 window (calibration uses the Qt picker).
+          cv_version=$(sed -n 's/^opencv-python==//p' requirements.txt | tr -d '\r ')
+          test -n "$cv_version"
+          python -m pip uninstall -y opencv-python
+          python -m pip install "opencv-python-headless==${cv_version}"
+          python -c "import cv2, os, PyQt5.QtCore; assert not os.path.isdir(os.path.join(os.path.dirname(cv2.__file__), 'qt')), 'cv2 still ships Qt'; print('cv2', cv2.__version__, 'Qt', PyQt5.QtCore.QT_VERSION_STR)"
           tesseract --version | head -1
       - name: Check the release matches this source
         run: |
