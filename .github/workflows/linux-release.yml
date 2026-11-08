@@ -155,6 +155,18 @@ jobs:
         # dump of every thread's stack (a headless hang names its test).
         timeout-minutes: 30
         run: timeout -k 30s -s ABRT 25m python -X faulthandler -m pytest -q --tb=no -rfE -p no:cacheprovider -o faulthandler_timeout=300
+      - name: Game-window capture on a real X server (the Wayland path)
+        # On Wayland Kaizen reads the game's X11 window instead of the black
+        # screen (src/capture/x11_windows.py). The suite above runs Qt
+        # offscreen, which skips that test; here it runs against Xvfb with a
+        # window manager (openbox publishes _NET_CLIENT_LIST like KWin does).
+        if: ${{ inputs.run_tests || inputs.tests_only }}
+        timeout-minutes: 10
+        run: |
+          sudo apt-get install -y xvfb openbox libxcomposite1
+          xvfb-run -a -s "-screen 0 1280x960x24 +extension Composite" bash -c '
+            openbox & sleep 2
+            QT_QPA_PLATFORM=xcb python -m pytest -q -s --tb=no -rfEs -p no:cacheprovider tests/test_x11_window_capture_live.py'
       - name: Build and smoke-test the frozen app
         if: ${{ !inputs.tests_only }}
         timeout-minutes: 45
